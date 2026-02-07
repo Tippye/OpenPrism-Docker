@@ -11,6 +11,7 @@ import { isTextFile, extractDocumentBody, mergeTemplateBody } from '../utils/tex
 import { readTemplateManifest, copyTemplateIntoProject } from '../services/templateService.js';
 import { getProjectRoot } from '../services/projectService.js';
 import { downloadArxivSource, extractArxivId } from '../services/arxivService.js';
+import { getLang, t } from '../i18n/index.js';
 
 export function registerProjectRoutes(fastify) {
   fastify.get('/api/projects', async () => {
@@ -22,7 +23,14 @@ export function registerProjectRoutes(fastify) {
       const metaPath = path.join(DATA_DIR, entry.name, 'project.json');
       try {
         const meta = await readJson(metaPath);
-        projects.push(meta);
+        projects.push({
+          ...meta,
+          updatedAt: meta.updatedAt || meta.createdAt,
+          tags: meta.tags || [],
+          archived: meta.archived || false,
+          trashed: meta.trashed || false,
+          trashedAt: meta.trashedAt || null
+        });
       } catch {
         // ignore
       }
@@ -46,6 +54,7 @@ export function registerProjectRoutes(fastify) {
   });
 
   fastify.post('/api/projects/import-zip', async (req) => {
+    const lang = getLang(req);
     await ensureDir(DATA_DIR);
     const id = crypto.randomUUID();
     const projectRoot = path.join(DATA_DIR, id);
@@ -81,7 +90,7 @@ export function registerProjectRoutes(fastify) {
       }
     } catch (err) {
       await fs.rm(projectRoot, { recursive: true, force: true });
-      return { ok: false, error: `Zip 解压失败: ${String(err)}` };
+      return { ok: false, error: t(lang, 'zip_extract_failed', { error: String(err) }) };
     }
 
     if (!hasZip) {
@@ -93,11 +102,27 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: meta };
   });
 
-  fastify.post('/api/projects/import-arxiv', async (req) => {
+  fastify.get('/api/projects/import-arxiv-sse', async (req, reply) => {
+    const lang = getLang(req);
     await ensureDir(DATA_DIR);
-    const { arxivIdOrUrl, projectName } = req.body || {};
+    const { arxivIdOrUrl, projectName } = req.query;
     const arxivId = extractArxivId(arxivIdOrUrl);
-    if (!arxivId) return { ok: false, error: 'Invalid arXiv ID.' };
+    req.log.info({ arxivId, arxivIdOrUrl }, 'import-arxiv-sse: parsed id');
+
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive'
+    });
+    const send = (event, data) => {
+      reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    if (!arxivId) {
+      send('error', { error: 'Invalid arXiv ID.' });
+      reply.raw.end();
+      return reply;
+    }
 
     const id = crypto.randomUUID();
     const projectRoot = path.join(DATA_DIR, id);
@@ -110,7 +135,13 @@ export function registerProjectRoutes(fastify) {
 
     const tmpTar = path.join(projectRoot, '__arxiv_source.tar.gz');
     try {
-      await downloadArxivSource(arxivId, tmpTar);
+      send('progress', { phase: 'download', percent: 0 });
+      await downloadArxivSource(arxivId, tmpTar, ({ received, total }) => {
+        const percent = total > 0 ? Math.round((received / total) * 100) : -1;
+        send('progress', { phase: 'download', percent, received, total });
+      });
+
+      send('progress', { phase: 'extract', percent: -1 });
       await tar.x({
         file: tmpTar,
         cwd: projectRoot,
@@ -122,13 +153,17 @@ export function registerProjectRoutes(fastify) {
       });
     } catch (err) {
       await fs.rm(projectRoot, { recursive: true, force: true });
-      return { ok: false, error: `arXiv 下载失败: ${String(err)}` };
+      send('error', { error: t(lang, 'arxiv_download_failed', { error: String(err) }) });
+      reply.raw.end();
+      return reply;
     } finally {
       await fs.rm(tmpTar, { force: true });
     }
 
     await writeJson(path.join(projectRoot, 'project.json'), meta);
-    return { ok: true, project: meta };
+    send('done', { ok: true, project: meta });
+    reply.raw.end();
+    return reply;
   });
 
   fastify.post('/api/projects/:id/rename-project', async (req) => {
@@ -143,11 +178,81 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: next };
   });
 
+  fastify.post('/api/projects/:id/copy', async (req) => {
+    const { id } = req.params;
+    const { name } = req.body || {};
+    const srcRoot = await getProjectRoot(id);
+    const srcMeta = await readJson(path.join(srcRoot, 'project.json'));
+    const newId = crypto.randomUUID();
+    const destRoot = path.join(DATA_DIR, newId);
+    await copyDir(srcRoot, destRoot);
+    const newMeta = {
+      ...srcMeta,
+      id: newId,
+      name: name || `${srcMeta.name} (Copy)`,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      trashed: false,
+      trashedAt: null,
+    };
+    await writeJson(path.join(destRoot, 'project.json'), newMeta);
+    return { ok: true, project: newMeta };
+  });
+
   fastify.delete('/api/projects/:id', async (req) => {
+    const { id } = req.params;
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = { ...meta, trashed: true, trashedAt: new Date().toISOString() };
+    await writeJson(metaPath, next);
+    return { ok: true };
+  });
+
+  fastify.delete('/api/projects/:id/permanent', async (req) => {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
     await fs.rm(projectRoot, { recursive: true, force: true });
     return { ok: true };
+  });
+
+  fastify.patch('/api/projects/:id/tags', async (req) => {
+    const { id } = req.params;
+    const { tags } = req.body || {};
+    if (!Array.isArray(tags)) return { ok: false, error: 'tags must be an array' };
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = { ...meta, tags, updatedAt: new Date().toISOString() };
+    await writeJson(metaPath, next);
+    return { ok: true, project: next };
+  });
+
+  fastify.patch('/api/projects/:id/archive', async (req) => {
+    const { id } = req.params;
+    const { archived } = req.body || {};
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = { ...meta, archived: !!archived, updatedAt: new Date().toISOString() };
+    await writeJson(metaPath, next);
+    return { ok: true, project: next };
+  });
+
+  fastify.patch('/api/projects/:id/trash', async (req) => {
+    const { id } = req.params;
+    const { trashed } = req.body || {};
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    const next = {
+      ...meta,
+      trashed: !!trashed,
+      trashedAt: trashed ? new Date().toISOString() : null,
+      updatedAt: new Date().toISOString()
+    };
+    await writeJson(metaPath, next);
+    return { ok: true, project: next };
   });
 
   fastify.get('/api/projects/:id/tree', async (req) => {
@@ -234,6 +339,12 @@ export function registerProjectRoutes(fastify) {
     const abs = safeJoin(projectRoot, filePath);
     await ensureDir(path.dirname(abs));
     await fs.writeFile(abs, content ?? '', 'utf8');
+    try {
+      const metaPath = path.join(projectRoot, 'project.json');
+      const meta = await readJson(metaPath);
+      meta.updatedAt = new Date().toISOString();
+      await writeJson(metaPath, meta);
+    } catch { /* ignore */ }
     return { ok: true };
   });
 
@@ -259,7 +370,7 @@ export function registerProjectRoutes(fastify) {
     const { id } = req.params;
     const { targetTemplate, mainFile = 'main.tex' } = req.body || {};
     if (!targetTemplate) return { ok: false, error: 'Missing targetTemplate' };
-    const templates = await readTemplateManifest();
+    const { templates } = await readTemplateManifest();
     const template = templates.find((item) => item.id === targetTemplate);
     if (!template) return { ok: false, error: 'Unknown template' };
 

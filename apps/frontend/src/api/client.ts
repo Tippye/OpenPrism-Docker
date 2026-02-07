@@ -2,6 +2,11 @@ export interface ProjectMeta {
   id: string;
   name: string;
   createdAt: string;
+  updatedAt: string;
+  tags: string[];
+  archived: boolean;
+  trashed: boolean;
+  trashedAt: string | null;
 }
 
 export interface FileItem {
@@ -23,6 +28,18 @@ export interface TemplateMeta {
   id: string;
   label: string;
   mainFile: string;
+  category: string;
+  description: string;
+  descriptionEn: string;
+  tags: string[];
+  author: string;
+  featured: boolean;
+}
+
+export interface TemplateCategory {
+  id: string;
+  label: string;
+  labelEn: string;
 }
 
 export interface ArxivPaper {
@@ -34,13 +51,24 @@ export interface ArxivPaper {
 }
 
 const API_BASE = '';
+const LANG_KEY = 'openprism-lang';
+
+function getLangHeader() {
+  if (typeof window === 'undefined') return 'zh-CN';
+  const stored = window.localStorage.getItem(LANG_KEY);
+  return stored === 'en-US' ? 'en-US' : 'zh-CN';
+}
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const lang = getLangHeader();
+  const mergedHeaders = {
+    'Content-Type': 'application/json',
+    'x-lang': lang,
+    ...(options?.headers || {})
+  };
   const res = await fetch(`${API_BASE}${url}`, {
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    ...options
+    ...options,
+    headers: mergedHeaders
   });
   if (!res.ok) {
     throw new Error(await res.text());
@@ -66,9 +94,43 @@ export function renameProject(id: string, name: string) {
   });
 }
 
+export function copyProject(id: string, name?: string) {
+  return request<{ ok: boolean; project?: ProjectMeta; error?: string }>(`/api/projects/${id}/copy`, {
+    method: 'POST',
+    body: JSON.stringify({ name })
+  });
+}
+
 export function deleteProject(id: string) {
   return request<{ ok: boolean; error?: string }>(`/api/projects/${id}`, {
     method: 'DELETE'
+  });
+}
+
+export function permanentDeleteProject(id: string) {
+  return request<{ ok: boolean }>(`/api/projects/${id}/permanent`, {
+    method: 'DELETE'
+  });
+}
+
+export function updateProjectTags(id: string, tags: string[]) {
+  return request<{ ok: boolean; project?: ProjectMeta }>(`/api/projects/${id}/tags`, {
+    method: 'PATCH',
+    body: JSON.stringify({ tags })
+  });
+}
+
+export function archiveProject(id: string, archived: boolean) {
+  return request<{ ok: boolean; project?: ProjectMeta }>(`/api/projects/${id}/archive`, {
+    method: 'PATCH',
+    body: JSON.stringify({ archived })
+  });
+}
+
+export function trashProject(id: string, trashed: boolean) {
+  return request<{ ok: boolean; project?: ProjectMeta }>(`/api/projects/${id}/trash`, {
+    method: 'PATCH',
+    body: JSON.stringify({ trashed })
   });
 }
 
@@ -124,7 +186,10 @@ export async function uploadFiles(projectId: string, files: File[], basePath?: s
   });
   const res = await fetch(`/api/projects/${projectId}/upload`, {
     method: 'POST',
-    body: form
+    body: form,
+    headers: {
+      'x-lang': getLangHeader()
+    }
   });
   if (!res.ok) {
     throw new Error(await res.text());
@@ -154,7 +219,7 @@ export function runAgent(payload: {
 export function compileProject(payload: {
   projectId: string;
   mainFile: string;
-  engine: 'tectonic';
+  engine: 'pdflatex' | 'xelatex' | 'lualatex' | 'latexmk' | 'tectonic';
 }) {
   return request<{ ok: boolean; pdf?: string; log?: string; status?: number; engine?: string; error?: string }>(
     `/api/compile`,
@@ -166,17 +231,7 @@ export function compileProject(payload: {
 }
 
 export function listTemplates() {
-  return request<{ templates: TemplateMeta[] }>('/api/templates');
-}
-
-export function convertTemplate(payload: { projectId: string; targetTemplate: string; mainFile: string }) {
-  return request<{ ok: boolean; mainFile?: string; changedFiles?: string[]; error?: string }>(
-    `/api/projects/${payload.projectId}/convert-template`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ targetTemplate: payload.targetTemplate, mainFile: payload.mainFile })
-    }
-  );
+  return request<{ templates: TemplateMeta[]; categories?: TemplateCategory[] }>('/api/templates');
 }
 
 export function arxivSearch(payload: { query: string; maxResults?: number }) {
@@ -237,7 +292,10 @@ export async function importZip(payload: { file: File; projectName?: string }) {
   }
   const res = await fetch('/api/projects/import-zip', {
     method: 'POST',
-    body: form
+    body: form,
+    headers: {
+      'x-lang': getLangHeader()
+    }
   });
   if (!res.ok) {
     throw new Error(await res.text());
@@ -245,14 +303,37 @@ export async function importZip(payload: { file: File; projectName?: string }) {
   return res.json() as Promise<{ ok: boolean; project?: ProjectMeta; error?: string }>;
 }
 
-export function importArxiv(payload: { arxivIdOrUrl: string; projectName?: string }) {
-  return request<{ ok: boolean; project?: ProjectMeta; error?: string }>(
-    '/api/projects/import-arxiv',
-    {
-      method: 'POST',
-      body: JSON.stringify(payload)
-    }
-  );
+export function importArxivSSE(
+  payload: { arxivIdOrUrl: string; projectName?: string },
+  onProgress?: (data: { phase: string; percent: number; received?: number; total?: number }) => void
+): Promise<{ ok: boolean; project?: ProjectMeta; error?: string }> {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({ arxivIdOrUrl: payload.arxivIdOrUrl });
+    if (payload.projectName) params.set('projectName', payload.projectName);
+    const es = new EventSource(`/api/projects/import-arxiv-sse?${params.toString()}`);
+
+    es.addEventListener('progress', (e) => {
+      if (onProgress) {
+        try { onProgress(JSON.parse(e.data)); } catch {}
+      }
+    });
+    es.addEventListener('done', (e) => {
+      es.close();
+      try { resolve(JSON.parse(e.data)); } catch { resolve({ ok: true }); }
+    });
+    es.addEventListener('error', (e) => {
+      es.close();
+      const me = e as MessageEvent;
+      if (me.data) {
+        try {
+          const d = JSON.parse(me.data);
+          resolve({ ok: false, error: d.error || 'Unknown error' });
+          return;
+        } catch {}
+      }
+      reject(new Error('SSE connection failed'));
+    });
+  });
 }
 
 export async function visionToLatex(payload: {
@@ -274,7 +355,10 @@ export async function visionToLatex(payload: {
   }
   const res = await fetch('/api/vision/latex', {
     method: 'POST',
-    body: form
+    body: form,
+    headers: {
+      'x-lang': getLangHeader()
+    }
   });
   if (!res.ok) {
     throw new Error(await res.text());
