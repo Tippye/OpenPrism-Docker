@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  openprism:
+    build: .
+    container_name: openprism
+    ports:
+      - "8787:8787"
+    environment:
+      # LLM 配置
+      - OPENPRISM_LLM_ENDPOINT=http://host.docker.internal:4142/v1
+      - OPENPRISM_LLM_API_KEY=dummy
+      - OPENPRISM_LLM_MODEL=gh/gpt-4.1
+      
+      # 数据目录配置
+      - OPENPRISM_DATA_DIR=/app/data
+      
+      # 协作功能配置（生产环境必须设置）
+      - OPENPRISM_COLLAB_TOKEN_SECRET=dummy
+      - OPENPRISM_COLLAB_REQUIRE_TOKEN=true
+      - OPENPRISM_COLLAB_TOKEN_TTL=86400
+      
+      # MinerU 配置（可选，用于PDF转LaTeX）
+      # - OPENPRISM_MINERU_API_BASE=https://mineru.net/api/v4
+      # - OPENPRISM_MINERU_TOKEN=your-mineru-token
+      
+      # 服务端口
+      - PORT=8787
+      
+    volumes:
+      # 持久化数据存储（项目文件、模板缓存）
+      - ./data:/app/data
+      
+      # 可选：挂载本地TeX Live目录（如果需要使用宿主机的texlive）
+      # - /usr/local/texlive:/usr/local/texlive:ro
+      
+    restart: unless-stopped
+    
+    # 资源限制（TeX Live编译可能占用较多内存）
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
